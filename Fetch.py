@@ -48,6 +48,13 @@ CONFIG = {
     "retry_backoff_base": 2,        # exponential back-off base (seconds)
     "retry_backoff_max": 60,        # cap for back-off delay (seconds)
     "inter_request_sleep": 1.0,     # seconds between source requests
+    # SSL verification
+    # Point ssl_ca_cert at your corporate / proxy CA bundle (.crt or .pem)
+    # so requests trusts your org's TLS inspection certificate.
+    # Leave as None to use the system CA store.
+    # Set ssl_no_verify to True ONLY for local debugging — never in production.
+    "ssl_ca_cert": None,            # e.g. "/etc/ssl/certs/my-corp-ca.crt"
+    "ssl_no_verify": False,
     # Output
     "output_file": "tor_exit_nodes.xlsx",
     # Logging
@@ -69,7 +76,26 @@ log = logging.getLogger(__name__)
 # FETCH  (with retry + back-off)
 # ──────────────────────────────────────────────
 def fetch_url(url: str, cfg: dict) -> Optional[str]:
-    """GET *url* with timeout, retries, and exponential back-off."""
+    """
+    GET *url* with timeout, retries, exponential back-off, and SSL verification.
+
+    SSL behaviour (controlled via cfg):
+      ssl_ca_cert   : path to a CA bundle (.crt / .pem) — used for corporate
+                      TLS-inspection proxies.  None → system CA store.
+      ssl_no_verify : if True, disables certificate validation entirely.
+                      ⚠  Only for debugging — never in production.
+    """
+    if cfg.get("ssl_no_verify"):
+        ssl_verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        log.warning("SSL verification DISABLED — do not use in production!")
+    elif cfg.get("ssl_ca_cert"):
+        ssl_verify = cfg["ssl_ca_cert"]
+        log.debug("SSL verify using CA bundle: %s", ssl_verify)
+    else:
+        ssl_verify = True   # default: system CA store
+
     attempt = 0
     while attempt < cfg["retry_max_attempts"]:
         attempt += 1
@@ -78,6 +104,7 @@ def fetch_url(url: str, cfg: dict) -> Optional[str]:
             resp = requests.get(
                 url,
                 timeout=cfg["request_timeout"],
+                verify=ssl_verify,
                 headers={
                     "User-Agent": "TorExitFetcher/1.0 (security-policy-update)",
                     "Accept": "text/plain",
@@ -86,6 +113,14 @@ def fetch_url(url: str, cfg: dict) -> Optional[str]:
             resp.raise_for_status()
             log.info("  → %d bytes received (HTTP %s)", len(resp.content), resp.status_code)
             return resp.text
+        except requests.exceptions.SSLError as exc:
+            log.error("  SSL error: %s", exc)
+            log.error(
+                "  Tip: if your network uses TLS inspection, pass your corporate "
+                "CA certificate with --ca-cert /path/to/corp-ca.crt"
+            )
+            # SSL errors are not retried — wrong cert will always fail
+            return None
         except requests.exceptions.Timeout:
             log.warning("  Timeout on %s", url)
         except requests.exceptions.HTTPError as exc:
@@ -469,6 +504,33 @@ def parse_args():
         default=CONFIG["log_level"],
         help="Logging verbosity.",
     )
+
+    ssl_group = p.add_argument_group(
+        "SSL / TLS",
+        "Control certificate verification. Use --ca-cert when your network "
+        "terminates TLS (e.g. corporate proxy / Zscaler / Palo Alto NGFW).",
+    )
+    ssl_group.add_argument(
+        "--ca-cert",
+        metavar="PATH",
+        default=CONFIG["ssl_ca_cert"],
+        help=(
+            "Path to a CA certificate bundle (.crt or .pem) to use for SSL "
+            "verification. Typical locations: "
+            "/etc/ssl/certs/ca-certificates.crt (Linux), "
+            "~/Library/Application Support/... (macOS), "
+            "C:\\certs\\corp-ca.crt (Windows)."
+        ),
+    )
+    ssl_group.add_argument(
+        "--no-verify",
+        action="store_true",
+        default=CONFIG["ssl_no_verify"],
+        help=(
+            "Disable SSL certificate verification entirely. "
+            "⚠  INSECURE — only for local debugging, never in production."
+        ),
+    )
     return p.parse_args()
 
 
@@ -485,5 +547,24 @@ if __name__ == "__main__":
     cfg["retry_backoff_base"]   = args.backoff_base
     cfg["retry_backoff_max"]    = args.backoff_max
     cfg["inter_request_sleep"]  = args.sleep
+
+    # ── SSL validation ──
+    if args.no_verify and args.ca_cert:
+        print("ERROR: --no-verify and --ca-cert are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.ca_cert:
+        import os
+        if not os.path.isfile(args.ca_cert):
+            print(f"ERROR: CA certificate file not found: {args.ca_cert!r}", file=sys.stderr)
+            sys.exit(1)
+        cfg["ssl_ca_cert"]   = args.ca_cert
+        cfg["ssl_no_verify"] = False
+    elif args.no_verify:
+        cfg["ssl_ca_cert"]   = None
+        cfg["ssl_no_verify"] = True
+    else:
+        cfg["ssl_ca_cert"]   = None
+        cfg["ssl_no_verify"] = False
 
     run(args.source, cfg)
