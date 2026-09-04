@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import bisect
 import ipaddress
 import json
 import os
@@ -8,7 +7,6 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 try:
@@ -16,6 +14,7 @@ try:
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
 except ImportError:
+    print("Error: Missing required packages. Run: pip install requests pandas openpyxl tqdm")
     sys.exit(1)
 
 try:
@@ -40,36 +39,29 @@ else:
 BASE_DIR = Path(__file__).resolve().parent
 CHECKPOINT_FILE = BASE_DIR / "checkpoint.json"
 QUOTA_FILE = BASE_DIR / "quota_tracker.json"
-BLOCKLIST_CACHE_DIR = BASE_DIR / "blocklist_cache"
-BLOCKLIST_MAX_AGE_HOURS = 12
 
 DAILY_QUOTAS = {
     "abuseipdb_check": 950,
-    "abuseipdb_blacklist": 4,
     "virustotal": 480,
 }
 
-BLOCKLIST_SOURCES = {
-    "spamhaus_drop": "https://www.spamhaus.org/drop/drop.txt",
-    "spamhaus_edrop": "https://www.spamhaus.org/drop/edrop.txt",
-    "firehol_level1": "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset",
-    "firehol_level2": "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset",
-    "blocklist_de": "https://lists.blocklist.de/lists/all.txt",
-    "feodotracker": "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
-    "cins_army": "http://cinsscore.com/list/ci-badguys.txt",
-}
-
-VT_SLEEP_SECONDS = 16
+SHODAN_SLEEP_SECONDS = 1.0
 ABUSEIPDB_SLEEP_SECONDS = 0.3
-INTERNETDB_CONCURRENCY = 20
-CHECKPOINT_SAVE_EVERY = 50
+VT_SLEEP_SECONDS = 15.5
+CHECKPOINT_SAVE_EVERY = 25
+
+SHODAN_MALICIOUS_TAGS = {"malware", "compromised", "c2", "botnet", "miner", "ransomware"}
+SHODAN_SUSPICIOUS_TAGS = {"vpn", "tor", "proxy", "scanner", "anonymizer", "tunnel"}
 
 def load_quota():
     today = str(date.today())
     if QUOTA_FILE.exists():
-        data = json.loads(QUOTA_FILE.read_text())
-        if data.get("date") == today:
-            return data
+        try:
+            data = json.loads(QUOTA_FILE.read_text())
+            if data.get("date") == today:
+                return data
+        except Exception:
+            pass
     return {"date": today, "used": {k: 0 for k in DAILY_QUOTAS}}
 
 def save_quota(quota):
@@ -83,121 +75,54 @@ def quota_consume(quota, key, n=1):
 
 def load_checkpoint():
     if CHECKPOINT_FILE.exists():
-        return json.loads(CHECKPOINT_FILE.read_text())
+        try:
+            return json.loads(CHECKPOINT_FILE.read_text())
+        except Exception:
+            return {}
     return {}
 
 def save_checkpoint(checkpoint):
     CHECKPOINT_FILE.write_text(json.dumps(checkpoint, indent=2))
 
-def download_blocklists():
-    BLOCKLIST_CACHE_DIR.mkdir(exist_ok=True)
-    for name, url in BLOCKLIST_SOURCES.items():
-        cache_file = BLOCKLIST_CACHE_DIR / f"{name}.txt"
-        if cache_file.exists():
-            age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
-            if age_hours < BLOCKLIST_MAX_AGE_HOURS:
-                continue
-        try:
-            resp = HTTP.get(url, timeout=30, headers={"User-Agent": "ip-recon/1.0"})
-            resp.raise_for_status()
-            cache_file.write_text(resp.text)
-        except Exception:
-            pass
-
-def build_blocklist_index():
-    ranges = []
-    for name in BLOCKLIST_SOURCES:
-        cache_file = BLOCKLIST_CACHE_DIR / f"{name}.txt"
-        if not cache_file.exists():
-            continue
-        for line in cache_file.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith(("#", ";")):
-                continue
-            token = line.split()[0]
-            try:
-                net = ipaddress.ip_network(token, strict=False)
-            except ValueError:
-                continue
-            if net.version != 4:
-                continue
-            ranges.append((int(net.network_address), int(net.broadcast_address), name))
-    ranges.sort(key=lambda r: r[0])
-    starts = [r[0] for r in ranges]
-    return ranges, starts
-
-def check_local_blocklists(ip, ranges, starts):
+def check_shodan_host(ip):
+    if not SHODAN_API_KEY:
+        return {"skipped": True}
     try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return []
-    if addr.version != 4:
-        return []
-    ip_int = int(addr)
-    matches = []
-    idx = bisect.bisect_right(starts, ip_int) - 1
-    i = idx
-    while i >= 0 and ranges[i][0] <= ip_int:
-        start, end, source = ranges[i]
-        if start <= ip_int <= end:
-            matches.append(source)
-        i -= 1
-        if idx - i > 5000:
-            break
-    return matches
-
-def pull_abuseipdb_blacklist(quota):
-    if not ABUSEIPDB_API_KEY:
-        return {}
-    if quota_remaining(quota, "abuseipdb_blacklist") <= 0:
-        return {}
-    try:
-        resp = HTTP.get(
-            "https://api.abuseipdb.com/api/v2/blacklist",
-            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
-            params={"confidenceMinimum": 75, "limit": 10000},
-            timeout=30,
-        )
-        quota_consume(quota, "abuseipdb_blacklist")
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return {row["ipAddress"]: row["abuseConfidenceScore"] for row in data}
-    except Exception:
-        return {}
-
-def check_internetdb(ip):
-    try:
-        resp = HTTP.get(f"https://internetdb.shodan.io/{ip}", timeout=10)
+        url = f"https://api.shodan.io/shodan/host/{ip}"
+        resp = HTTP.get(url, params={"key": SHODAN_API_KEY, "minify": "true"}, timeout=15)
         if resp.status_code == 404:
             return {"found": False}
+        if resp.status_code == 429:
+            time.sleep(2)
+            resp = HTTP.get(url, params={"key": SHODAN_API_KEY, "minify": "true"}, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         return {
             "found": True,
-            "ports": data.get("ports", []),
-            "tags": data.get("tags", []),
-            "vulns": data.get("vulns", []),
-            "hostnames": data.get("hostnames", []),
+            "ports": data.get("ports") or [],
+            "tags": data.get("tags") or [],
+            "vulns": list(data.get("vulns") or []),
+            "org": data.get("org", ""),
+            "asn": data.get("asn", ""),
+            "hostnames": data.get("hostnames") or [],
         }
-    except Exception:
-        return {"error": True}
+    except Exception as exc:
+        return {"error": str(exc)}
 
-def run_internetdb_tier(ips, checkpoint):
-    todo = [ip for ip in ips if "internetdb" not in checkpoint.get(ip, {})]
-    if not todo:
+def run_shodan_tier(ips, checkpoint):
+    if not SHODAN_API_KEY:
         return
-    with ThreadPoolExecutor(max_workers=INTERNETDB_CONCURRENCY) as pool:
-        futures = {pool.submit(check_internetdb, ip): ip for ip in todo}
-        count = 0
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Shodan"):
-            ip = futures[fut]
-            checkpoint.setdefault(ip, {})["internetdb"] = fut.result()
-            count += 1
-            if count % CHECKPOINT_SAVE_EVERY == 0:
-                save_checkpoint(checkpoint)
+    todo = [ip for ip in ips if "shodan" not in checkpoint.get(ip, {})]
+    for i, ip in enumerate(tqdm(todo, desc="Shodan API")):
+        checkpoint.setdefault(ip, {})["shodan"] = check_shodan_host(ip)
+        if (i + 1) % CHECKPOINT_SAVE_EVERY == 0:
+            save_checkpoint(checkpoint)
+        time.sleep(SHODAN_SLEEP_SECONDS)
     save_checkpoint(checkpoint)
 
 def check_abuseipdb(ip):
+    if not ABUSEIPDB_API_KEY:
+        return {"skipped": True}
     resp = HTTP.get(
         "https://api.abuseipdb.com/api/v2/check",
         headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
@@ -205,7 +130,7 @@ def check_abuseipdb(ip):
         timeout=15,
     )
     resp.raise_for_status()
-    d = resp.json()["data"]
+    d = resp.json().get("data") or {}
     return {
         "score": d.get("abuseConfidenceScore"),
         "reports": d.get("totalReports"),
@@ -215,11 +140,10 @@ def check_abuseipdb(ip):
         "is_tor": d.get("isTor"),
     }
 
-def run_abuseipdb_tier(ips, checkpoint, quota, known_bad):
+def run_abuseipdb_tier(ips, checkpoint, quota):
     if not ABUSEIPDB_API_KEY:
         return
-    needs_lookup = [ip for ip in ips if not checkpoint.get(ip, {}).get("blocklist_hits") and ip not in known_bad]
-    todo = [ip for ip in needs_lookup if "abuseipdb" not in checkpoint.get(ip, {})]
+    todo = [ip for ip in ips if "abuseipdb" not in checkpoint.get(ip, {})]
     remaining = quota_remaining(quota, "abuseipdb_check")
     batch = todo[:remaining]
     for i, ip in enumerate(tqdm(batch, desc="AbuseIPDB API")):
@@ -228,7 +152,7 @@ def run_abuseipdb_tier(ips, checkpoint, quota, known_bad):
         except Exception as exc:
             checkpoint.setdefault(ip, {})["abuseipdb"] = {"error": str(exc)}
         quota_consume(quota, "abuseipdb_check")
-        if i % CHECKPOINT_SAVE_EVERY == 0:
+        if (i + 1) % CHECKPOINT_SAVE_EVERY == 0:
             save_checkpoint(checkpoint)
             save_quota(quota)
         time.sleep(ABUSEIPDB_SLEEP_SECONDS)
@@ -242,7 +166,7 @@ def check_virustotal(ip):
         timeout=15,
     )
     resp.raise_for_status()
-    stats = resp.json()["data"]["attributes"]["last_analysis_stats"]
+    stats = resp.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
     return {
         "malicious": stats.get("malicious", 0),
         "suspicious": stats.get("suspicious", 0),
@@ -254,13 +178,13 @@ def run_virustotal_tier(unresolved_ips, checkpoint, quota):
     todo = [ip for ip in unresolved_ips if "virustotal" not in checkpoint.get(ip, {})]
     remaining = quota_remaining(quota, "virustotal")
     batch = todo[:remaining]
-    for i, ip in enumerate(tqdm(batch, desc="VirusTotal")):
+    for i, ip in enumerate(tqdm(batch, desc="VirusTotal API")):
         try:
             checkpoint.setdefault(ip, {})["virustotal"] = check_virustotal(ip)
         except Exception as exc:
             checkpoint.setdefault(ip, {})["virustotal"] = {"error": str(exc)}
         quota_consume(quota, "virustotal")
-        if i % CHECKPOINT_SAVE_EVERY == 0:
+        if (i + 1) % CHECKPOINT_SAVE_EVERY == 0:
             save_checkpoint(checkpoint)
             save_quota(quota)
         time.sleep(VT_SLEEP_SECONDS)
@@ -268,30 +192,33 @@ def run_virustotal_tier(unresolved_ips, checkpoint, quota):
     save_quota(quota)
 
 def compute_verdict(row):
-    blocklist_hits = row.get("blocklist_hits") or []
-    blacklist_score = row.get("abuseipdb_blacklist_score")
+    shodan = row.get("shodan") or {}
     abuseipdb = row.get("abuseipdb") or {}
     vt = row.get("virustotal") or {}
 
-    if blocklist_hits or (blacklist_score is not None and blacklist_score >= 90):
+    shodan_tags = set(t.lower() for t in (shodan.get("tags") or []))
+    shodan_vulns = shodan.get("vulns") or []
+
+    if bool(shodan_tags & SHODAN_MALICIOUS_TAGS):
         return "Malicious"
     if abuseipdb.get("score") is not None and abuseipdb["score"] >= 75:
         return "Malicious"
     if vt.get("malicious", 0) >= 3:
         return "Malicious"
 
-    if (blacklist_score is not None and blacklist_score >= 25) \
-            or (abuseipdb.get("score") is not None and 25 <= abuseipdb["score"] < 75) \
+    if bool(shodan_tags & SHODAN_SUSPICIOUS_TAGS) \
+            or len(shodan_vulns) >= 2 \
+            or (abuseipdb.get("score") is not None and 20 <= abuseipdb["score"] < 75) \
             or (0 < vt.get("malicious", 0) < 3) \
             or vt.get("suspicious", 0) > 0:
         return "Suspicious"
 
-    have_any_data = any([
-        blacklist_score is not None,
+    has_data = any([
+        shodan.get("found") is True,
         abuseipdb.get("score") is not None,
         "malicious" in vt,
     ])
-    if have_any_data:
+    if has_data:
         return "Not Malicious"
     return "Unknown / Not Checked Yet"
 
@@ -302,14 +229,13 @@ VERDICT_COLORS = {
     "Unknown / Not Checked Yet": "D9D9D9",
 }
 
-def export_excel(ips, checkpoint, blacklist_map, output_path):
+def export_excel(ips, checkpoint, output_path):
     rows = []
     for ip in ips:
         rec = dict(checkpoint.get(ip, {}))
-        rec["abuseipdb_blacklist_score"] = blacklist_map.get(ip)
         verdict = compute_verdict(rec)
 
-        internetdb = rec.get("internetdb") or {}
+        shodan = rec.get("shodan") or {}
         abuseipdb = rec.get("abuseipdb") or {}
         vt = rec.get("virustotal") or {}
 
@@ -317,20 +243,19 @@ def export_excel(ips, checkpoint, blacklist_map, output_path):
             "IP": ip,
             "IP Version": "IPv6" if ":" in ip else "IPv4",
             "Verdict": verdict,
-            "Blocklist Sources": ", ".join(rec.get("blocklist_hits") or []),
-            "AbuseIPDB Blacklist Score": rec.get("abuseipdb_blacklist_score"),
             "AbuseIPDB Score": abuseipdb.get("score"),
             "AbuseIPDB Reports": abuseipdb.get("reports"),
             "AbuseIPDB Country": abuseipdb.get("country"),
             "AbuseIPDB ISP": abuseipdb.get("isp"),
             "AbuseIPDB Usage Type": abuseipdb.get("usage_type"),
             "AbuseIPDB Is Tor": abuseipdb.get("is_tor"),
+            "Shodan Open Ports": ", ".join(str(p) for p in (shodan.get("ports") or [])),
+            "Shodan Tags": ", ".join(shodan.get("tags") or []),
+            "Shodan Vulns": ", ".join(shodan.get("vulns") or []),
+            "Shodan Org": shodan.get("org", ""),
             "VT Malicious": vt.get("malicious"),
             "VT Suspicious": vt.get("suspicious"),
             "VT Harmless": vt.get("harmless"),
-            "Shodan Open Ports": ", ".join(str(p) for p in internetdb.get("ports", []) or []),
-            "Shodan Known CVEs": ", ".join(internetdb.get("vulns", []) or []),
-            "Shodan Tags": ", ".join(internetdb.get("tags", []) or []),
         })
 
     df = pd.DataFrame(rows)
@@ -364,6 +289,7 @@ def load_ip_list(path):
     ips = []
     seen = set()
     if not Path(path).exists():
+        print(f"Error: The input file '{path}' was not found.")
         sys.exit(1)
     with open(path) as f:
         for line in f:
@@ -379,14 +305,6 @@ def load_ip_list(path):
                 ips.append(token)
     return ips
 
-def apply_blocklist_tier(ips, checkpoint):
-    download_blocklists()
-    ranges, starts = build_blocklist_index()
-    todo = [ip for ip in ips if "blocklist_hits" not in checkpoint.get(ip, {})]
-    for ip in tqdm(todo, desc="Blocklists"):
-        checkpoint.setdefault(ip, {})["blocklist_hits"] = check_local_blocklists(ip, ranges, starts)
-    save_checkpoint(checkpoint)
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default=INPUT_FILE_PATH)
@@ -394,29 +312,29 @@ def main():
     args = parser.parse_args()
 
     ips = load_ip_list(args.input)
+    if not ips:
+        print("No valid IPs found to process. Exiting.")
+        return
+
     checkpoint = load_checkpoint()
     quota = load_quota()
 
-    apply_blocklist_tier(ips, checkpoint)
-    blacklist_map = pull_abuseipdb_blacklist(quota)
-    save_quota(quota)
-
-    run_internetdb_tier(ips, checkpoint)
-    run_abuseipdb_tier(ips, checkpoint, quota, blacklist_map)
+    run_shodan_tier(ips, checkpoint)
+    run_abuseipdb_tier(ips, checkpoint, quota)
 
     unresolved_ips = []
     for ip in ips:
         rec = dict(checkpoint.get(ip, {}))
-        rec["abuseipdb_blacklist_score"] = blacklist_map.get(ip)
         if compute_verdict(rec) == "Unknown / Not Checked Yet":
             unresolved_ips.append(ip)
 
     if unresolved_ips and VT_API_KEY:
         ans = input(f"\n[?] {len(unresolved_ips)} IPs remain unverified after Shodan and AbuseIPDB.\nDo you want to query VirusTotal for these? (y/n): ").strip().lower()
-        if ans == 'y':
+        if ans == "y":
             run_virustotal_tier(unresolved_ips, checkpoint, quota)
 
-    export_excel(ips, checkpoint, blacklist_map, args.output)
+    export_excel(ips, checkpoint, args.output)
+    print(f"Report exported to: {args.output}")
 
 if __name__ == "__main__":
     main()
