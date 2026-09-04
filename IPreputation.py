@@ -85,8 +85,22 @@ ABUSEIPDB_API_KEY = "PASTE_YOUR_ABUSEIPDB_KEY_HERE"
 VT_API_KEY        = "PASTE_YOUR_VIRUSTOTAL_KEY_HERE"
 GREYNOISE_API_KEY = "PASTE_YOUR_GREYNOISE_KEY_HERE"        # optional, can leave blank
 
+#   Set the input/output paths so you can just run:  python3 ip_reputation_checker.py
+#   with no arguments at all. Use an absolute path if the file isn't sitting
+#   next to this script (Windows example: r"C:\Users\you\Desktop\ips.txt").
+#
+#   Examples:
+#     INPUT_FILE_PATH  = "ips.txt"
+#     INPUT_FILE_PATH  = "/home/you/Desktop/ips.txt"
+#     INPUT_FILE_PATH  = r"C:\Users\you\Desktop\ips.txt"
+#     OUTPUT_FILE_PATH = "/home/you/Desktop/ip_reputation_report.xlsx"
+
+INPUT_FILE_PATH  = "ips.txt"
+OUTPUT_FILE_PATH = "ip_reputation_report.xlsx"
+
 # --------------------------------------------------------------------------
 # ==========================================================================
+
 
 
 def _resolve_key(hardcoded, env_var_name):
@@ -579,6 +593,11 @@ def export_excel(ips, checkpoint, blacklist_map, output_path):
 def load_ip_list(path):
     ips = []
     seen = set()
+    if not Path(path).exists():
+        print(f"\nERROR: input file not found: {path}")
+        print("Check the INPUT_FILE_PATH in the CONFIG box at the top of this "
+              "script (or the --input argument if you passed one).")
+        sys.exit(1)
     with open(path) as f:
         for line in f:
             token = line.strip()
@@ -608,8 +627,10 @@ def apply_blocklist_tier(ips, checkpoint):
 
 def main():
     parser = argparse.ArgumentParser(description="Bulk IP reputation checker (free-tier friendly)")
-    parser.add_argument("--input", default="ips.txt", help="Path to text file, one IP per line")
-    parser.add_argument("--output", default="ip_reputation_report.xlsx", help="Output Excel path")
+    parser.add_argument("--input", default=INPUT_FILE_PATH,
+                         help=f"Path to text file, one IP per line (default from CONFIG box: {INPUT_FILE_PATH})")
+    parser.add_argument("--output", default=OUTPUT_FILE_PATH,
+                         help=f"Output Excel path (default from CONFIG box: {OUTPUT_FILE_PATH})")
     parser.add_argument("--skip-internetdb", action="store_true")
     parser.add_argument("--skip-individual-apis", action="store_true",
                          help="Only run Tier 0/0.5/1 (free, unlimited, fast pass)")
@@ -644,8 +665,10 @@ def main():
         run_individual_api_tier(ips, checkpoint, quota, blacklist_map)
 
     # Export
-    print(f"Writing report to {args.output} ...")
-    export_excel(ips, checkpoint, blacklist_map, args.output)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Writing report to {output_path} ...")
+    export_excel(ips, checkpoint, blacklist_map, str(output_path))
     print("Done.")
 
     # Summary
