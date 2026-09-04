@@ -3,29 +3,43 @@
 Bulk IP Reputation Checker
 ==========================
 
-Checks a large list of IPs (e.g. 19,000) against multiple FREE threat-intel
-sources and produces a single Excel report.
+Checks a large list of IPs (e.g. 19,000) against multiple threat-intel
+sources and produces a single Excel report with one final Verdict column
+(Malicious / Suspicious / Not Malicious / Unknown-Not-Checked-Yet).
 
-Strategy (cheapest/fastest sources first, so you burn as few rate-limited
-API calls as possible):
+Strategy (cheapest/fastest/highest-volume sources first, so the slow,
+quota-capped vendors only ever see the small residual of IPs nothing else
+could resolve):
 
   Tier 0   Local static blocklists (Spamhaus DROP/EDROP, FireHOL, Blocklist.de,
            Feodo Tracker, CINS Army). No API key, no rate limit, covers all
-           IPs instantly.
+           IPs instantly. Any hit = Malicious, done.
   Tier 0.5 AbuseIPDB "blacklist" endpoint (5 calls/day, up to 10,000 IPs per
            call) -> cross-referenced locally, doesn't touch your 1,000/day
            per-IP check quota.
-  Tier 1   Shodan InternetDB (no key, effectively no rate limit). Not a
-           malicious/clean verdict, but flags exposed services / known CVEs.
+  Tier 1   Shodan's full paid host API (/shodan/host/{ip}), using your
+           membership. IMPORTANT: Shodan is an exposure/recon database, not
+           a reputation feed -- it does not hand you a native "malicious"
+           verdict. This tier flags a small, editable set of high-signal
+           tags (see SHODAN_MALICIOUS_TAGS) and otherwise just enriches the
+           report with open ports / known CVEs / org info. Rate-limited
+           (not daily-quota-limited) with a thread pool + adaptive backoff,
+           so it's the tier that realistically clears all ~19k IPs within a
+           few hours -- tune SHODAN_MAX_WORKERS to your plan's rate limit.
   Tier 2   Individual API lookups for whatever is STILL unresolved after
-           Tiers 0-1: AbuseIPDB check, VirusTotal, (optional) GreyNoise.
-           These respect each vendor's real daily quota and checkpoint their
-           progress, so you can stop the script and re-run it tomorrow and
-           it picks up exactly where it left off.
+           Tiers 0-1: AbuseIPDB check, then VirusTotal (round-robins across
+           up to 2 API keys to roughly double free-tier throughput),
+           (optional) GreyNoise. These respect each vendor's real daily
+           quota and checkpoint their progress, so you can stop the script
+           and re-run it tomorrow and it picks up exactly where it left off.
+           This is the tier most likely to need more than one day if the
+           residual after Tiers 0-1 is large -- see the printed summary.
 
 Usage:
     export ABUSEIPDB_API_KEY="..."
-    export VT_API_KEY="..."
+    export SHODAN_API_KEY="..."
+    export VT_API_KEY_1="..."
+    export VT_API_KEY_2="..."        # optional second VT account
     export GREYNOISE_API_KEY="..."   # optional
     python3 ip_reputation_checker.py --input ips.txt --output report.xlsx
 
@@ -70,9 +84,12 @@ except ImportError:
 #   ("") to skip that vendor entirely -- the script will just print
 #   "skipping" for that tier and keep going with the others.
 #
-#   Get free keys here:
+#   Get keys here:
+#     Shodan     -> https://account.shodan.io/  (use your paid membership key)
 #     AbuseIPDB  -> https://www.abuseipdb.com/register
-#     VirusTotal -> https://www.virustotal.com/gui/join-us
+#     VirusTotal -> https://www.virustotal.com/gui/join-us  (you can paste in
+#                   TWO separate accounts' keys below -- the script rotates
+#                   between them to roughly double VT throughput/quota)
 #     GreyNoise  -> https://viz.greynoise.io/account/   (optional)
 #
 #   SECURITY NOTE: once you paste real keys in here, this file contains a
@@ -81,8 +98,10 @@ except ImportError:
 #
 # --------------------------------------------------------------------------
 
+SHODAN_API_KEY    = "PASTE_YOUR_SHODAN_KEY_HERE"
 ABUSEIPDB_API_KEY = "PASTE_YOUR_ABUSEIPDB_KEY_HERE"
-VT_API_KEY        = "PASTE_YOUR_VIRUSTOTAL_KEY_HERE"
+VT_API_KEY_1      = "PASTE_YOUR_VIRUSTOTAL_KEY_1_HERE"
+VT_API_KEY_2      = "PASTE_YOUR_VIRUSTOTAL_KEY_2_HERE"     # optional 2nd VT account, can leave blank
 GREYNOISE_API_KEY = "PASTE_YOUR_GREYNOISE_KEY_HERE"        # optional, can leave blank
 
 #   Set the input/output paths so you can just run:  python3 ip_reputation_checker.py
