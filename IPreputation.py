@@ -98,6 +98,25 @@ GREYNOISE_API_KEY = "PASTE_YOUR_GREYNOISE_KEY_HERE"        # optional, can leave
 INPUT_FILE_PATH  = "ips.txt"
 OUTPUT_FILE_PATH = "ip_reputation_report.xlsx"
 
+#   If you're behind a corporate proxy/firewall that does SSL/TLS inspection,
+#   requests will fail with a certificate verification error unless you point
+#   this at your organization's CA bundle (a .pem or .crt file -- ask your IT
+#   / security team for it, or export it from your browser's trusted root
+#   certificates).
+#
+#   Examples:
+#     SSL_CERT_PATH = ""                                   # use default system certs (normal case)
+#     SSL_CERT_PATH = "/home/you/certs/corporate-ca.pem"
+#     SSL_CERT_PATH = r"C:\certs\corporate-ca.pem"
+#
+#   SSL_VERIFY_DISABLE is an escape hatch for quick troubleshooting only --
+#   it turns verification off completely, which means your traffic could be
+#   intercepted without you knowing. Leave it False; only flip it to True
+#   temporarily if you're stuck and don't yet have the CA bundle.
+
+SSL_CERT_PATH = ""
+SSL_VERIFY_DISABLE = False
+
 # --------------------------------------------------------------------------
 # ==========================================================================
 
@@ -118,6 +137,41 @@ def _resolve_key(hardcoded, env_var_name):
 ABUSEIPDB_API_KEY = _resolve_key(ABUSEIPDB_API_KEY, "ABUSEIPDB_API_KEY")
 VT_API_KEY = _resolve_key(VT_API_KEY, "VT_API_KEY")
 GREYNOISE_API_KEY = _resolve_key(GREYNOISE_API_KEY, "GREYNOISE_API_KEY")
+
+# --- SSL/TLS verification setup ------------------------------------------
+# Also honor a CUSTOM_CA_BUNDLE / SSL_CERT_PATH env var, mirroring the API
+# key pattern, in case you'd rather not hardcode the path in the file.
+_env_cert_path = os.environ.get("SSL_CERT_PATH", "").strip()
+if SSL_CERT_PATH.strip():
+    _resolved_cert_path = SSL_CERT_PATH.strip()
+elif _env_cert_path:
+    _resolved_cert_path = _env_cert_path
+else:
+    _resolved_cert_path = ""
+
+if SSL_VERIFY_DISABLE:
+    REQUESTS_VERIFY = False
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    print("WARNING: SSL_VERIFY_DISABLE is True -- certificate verification "
+          "is OFF for all requests. This is insecure; only use it temporarily.")
+elif _resolved_cert_path:
+    if not Path(_resolved_cert_path).exists():
+        print(f"WARNING: SSL_CERT_PATH is set to '{_resolved_cert_path}' but "
+              f"that file doesn't exist. Falling back to default certificate "
+              f"verification, which will likely fail if you're behind an "
+              f"SSL-inspecting proxy.")
+        REQUESTS_VERIFY = True
+    else:
+        REQUESTS_VERIFY = _resolved_cert_path
+else:
+    REQUESTS_VERIFY = True
+
+# Every HTTP call in this script goes through this one session, so the SSL
+# setting above is applied consistently everywhere (blocklists, AbuseIPDB,
+# VirusTotal, GreyNoise, Shodan InternetDB).
+HTTP = requests.Session()
+HTTP.verify = REQUESTS_VERIFY
 
 BASE_DIR = Path(__file__).resolve().parent
 CHECKPOINT_FILE = BASE_DIR / "checkpoint.json"
@@ -206,7 +260,7 @@ def download_blocklists():
             if age_hours < BLOCKLIST_MAX_AGE_HOURS:
                 continue
         try:
-            resp = requests.get(url, timeout=30, headers={"User-Agent": "ip-recon-script/1.0"})
+            resp = HTTP.get(url, timeout=30, headers={"User-Agent": "ip-recon-script/1.0"})
             resp.raise_for_status()
             cache_file.write_text(resp.text)
             print(f"  [blocklist] refreshed {name} ({len(resp.text.splitlines())} lines)")
@@ -277,7 +331,7 @@ def pull_abuseipdb_blacklist(quota):
         print("  [abuseipdb-blacklist] daily quota used up, skipping")
         return {}
     try:
-        resp = requests.get(
+        resp = HTTP.get(
             "https://api.abuseipdb.com/api/v2/blacklist",
             headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
             params={"confidenceMinimum": 75, "limit": 10000},
@@ -300,7 +354,7 @@ def pull_abuseipdb_blacklist(quota):
 
 def check_internetdb(ip):
     try:
-        resp = requests.get(f"https://internetdb.shodan.io/{ip}", timeout=10)
+        resp = HTTP.get(f"https://internetdb.shodan.io/{ip}", timeout=10)
         if resp.status_code == 404:
             return {"found": False}
         resp.raise_for_status()
@@ -338,7 +392,7 @@ def run_internetdb_tier(ips, checkpoint):
 # --------------------------------------------------------------------------
 
 def check_abuseipdb(ip):
-    resp = requests.get(
+    resp = HTTP.get(
         "https://api.abuseipdb.com/api/v2/check",
         headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
         params={"ipAddress": ip, "maxAgeInDays": 90},
@@ -357,7 +411,7 @@ def check_abuseipdb(ip):
 
 
 def check_virustotal(ip):
-    resp = requests.get(
+    resp = HTTP.get(
         f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
         headers={"x-apikey": VT_API_KEY},
         timeout=15,
@@ -373,7 +427,7 @@ def check_virustotal(ip):
 
 
 def check_greynoise(ip):
-    resp = requests.get(
+    resp = HTTP.get(
         f"https://api.greynoise.io/v3/community/{ip}",
         headers={"key": GREYNOISE_API_KEY, "Accept": "application/json"},
         timeout=15,
